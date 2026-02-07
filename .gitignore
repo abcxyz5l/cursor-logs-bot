@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# Bot runtime
+downloads/
+results/
+*.log
+.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
