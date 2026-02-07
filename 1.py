@@ -33,6 +33,9 @@ except ImportError:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8380922566:AAFCAn2Y-iClE7aMtue9ypNayWro464u8tg")
 DOWNLOAD_DIR = "downloads"
 RESULTS_DIR = "results"
+# 8 vCPU / 8 GB RAM: use all cores for extraction, large download chunks
+EXTRACTION_THREADS = max(1, int(os.environ.get("EXTRACTION_THREADS", "8")))
+DOWNLOAD_CHUNK_MB = max(16, int(os.environ.get("DOWNLOAD_CHUNK_MB", "128")))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -110,8 +113,8 @@ def _get_all_extraction_tools() -> list[str]:
     """Return list of extraction tool paths (unrar first for RAR, then 7z, etc.)."""
     found: list[str] = []
     seen_paths: set[str] = set()
-    # Prefer unrar for RAR; then 7z/7za (order: unrar, 7z, 7za, WinRAR)
-    for tool in ("unrar", "7z", "7za", "unrar.exe", "7z.exe", "7za.exe", "WinRAR.exe", "Rar.exe"):
+    # Prefer 7z first (multi-thread -mmt=on = faster); then unrar for RAR compatibility
+    for tool in ("7z", "7za", "unrar", "7z.exe", "7za.exe", "unrar.exe", "WinRAR.exe", "Rar.exe"):
         path = shutil.which(tool)
         if path and path not in seen_paths:
             seen_paths.add(path)
@@ -131,11 +134,21 @@ def _get_all_extraction_tools() -> list[str]:
     return found
 
 
+def _extraction_timeout_seconds(archive_path: str) -> int:
+    """Timeout for extraction: 10 min base + 3 min per 100 MB, max 2 hours (for 3+ GB archives)."""
+    try:
+        size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+    except Exception:
+        size_mb = 0
+    return min(7200, max(600, 600 + int(size_mb / 100) * 180))
+
+
 def _run_extraction_tool(tool: str, archive_path: str, extract_to_dir: str, password: str | None) -> bool:
-    """Run one extraction tool. Returns True on success."""
+    """Run one extraction tool. Returns True on success. 7z uses -mmt=on for multi-thread (faster)."""
     tool_lower = tool.lower()
     if "7z" in tool_lower:
-        cmd = [tool, "x", "-y", f"-o{extract_to_dir}", archive_path]
+        # -mmt=N = use N CPU cores (tuned for 8 vCPU; set EXTRACTION_THREADS env to override)
+        cmd = [tool, "x", f"-mmt={EXTRACTION_THREADS}", "-y", f"-o{extract_to_dir}", archive_path]
         if password:
             cmd.insert(2, f"-p{password}")
     elif "unrar" in tool_lower:
@@ -148,7 +161,9 @@ def _run_extraction_tool(tool: str, archive_path: str, extract_to_dir: str, pass
             cmd.insert(-2, f"-p{password}")
     else:
         return False
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    timeout = _extraction_timeout_seconds(archive_path)
+    debug_log(f"[TOOLS] Extraction timeout: {timeout}s ({timeout // 60} min)")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode == 0:
         return True
     if result.stderr:
@@ -212,6 +227,17 @@ def extract_archive_once(archive_path: str, extract_to_dir: str, password: str |
                 is_tar = False
 
         if is_zip:
+            # ZIP >= 10 MB: use 7z multi-thread for speed; fallback to zipfile
+            try:
+                size_mb = os.path.getsize(archive_path) / (1024 * 1024)
+            except Exception:
+                size_mb = 0
+            if size_mb >= 10:  # Use multi-thread 7z for ZIP >= 10 MB (faster than single-thread zipfile)
+                for t in _get_all_extraction_tools():
+                    if "7z" in t.lower():
+                        if _run_extraction_tool(t, archive_path, extract_to_dir, password):
+                            return True
+                        break
             with zipfile.ZipFile(archive_path) as z:
                 pwd = password.encode("utf-8") if password else None
                 z.extractall(extract_to_dir, pwd=pwd)
@@ -242,6 +268,12 @@ def extract_archive_once(archive_path: str, extract_to_dir: str, password: str |
                         "• UnRAR (https://www.rarlab.com/rar_add.htm)"
                     )
         elif is_7z:
+            # Prefer 7z CLI with -mmt=on (multi-thread, faster); fallback to py7zr
+            for t in _get_all_extraction_tools():
+                if "7z" in t.lower():
+                    if _run_extraction_tool(t, archive_path, extract_to_dir, password):
+                        return True
+                    break
             if py7zr is None:
                 raise RuntimeError("7Z archive detected but 'py7zr' is not installed. Install with: pip install py7zr")
             try:
@@ -480,7 +512,7 @@ async def download_file(
     - On SSL errors, retries once with SSL verification disabled (useful when Windows reports "Access is denied")
     - Supports stop flag to cancel download
     """
-    chunk_size = 1024 * 1024 * 64  # 64 MB for max download speed (Railway/server)
+    chunk_size = 1024 * 1024 * DOWNLOAD_CHUNK_MB  # 128 MB for 8 GB RAM; set DOWNLOAD_CHUNK_MB env to override
 
     # ssl_setting: None -> default verification, False -> disable verification
     ssl_setting = None
@@ -1551,17 +1583,32 @@ async def process_selected_actions(update: Update, context: ContextTypes.DEFAULT
         context.user_data.clear()
         return
     
-    await safe_edit(main_msg, f"✅ Downloaded successfully!\nExtracting archive...")
+    # Large archives (e.g. 3+ GB) can take 20–60+ min on Railway – set long timeout and inform user
+    try:
+        size_mb = os.path.getsize(dest_path) / (1024 * 1024)
+        if size_mb > 500:
+            await safe_edit(main_msg, f"✅ Downloaded successfully!\nExtracting archive ({size_mb:.0f} MB)...\n⏳ Large file – may take 15–45+ min, please wait.")
+        else:
+            await safe_edit(main_msg, f"✅ Downloaded successfully!\nExtracting archive...")
+    except Exception:
+        await safe_edit(main_msg, f"✅ Downloaded successfully!\nExtracting archive...")
     
-    # Extract ONCE here
+    # Extract ONCE here (long timeout for 3+ GB archives – can take 20–60+ min)
     extracted_dir = None
     try:
         extracted_dir = tempfile.mkdtemp(prefix="archive_extract_", dir=RESULTS_DIR)
         loop = asyncio.get_running_loop()
-        debug_log(f"[MAIN] Starting extraction to: {extracted_dir}")
-        await loop.run_in_executor(None, extract_archive_once, dest_path, extracted_dir, pwd)
+        extract_timeout = _extraction_timeout_seconds(dest_path)
+        debug_log(f"[MAIN] Starting extraction to: {extracted_dir} (timeout={extract_timeout}s)")
+        await asyncio.wait_for(
+            loop.run_in_executor(None, extract_archive_once, dest_path, extracted_dir, pwd),
+            timeout=float(extract_timeout),
+        )
         debug_log(f"[MAIN] Extraction completed")
         await safe_edit(main_msg, f"✅ Archive extracted!\nProcessing actions...")
+    except asyncio.TimeoutError:
+        debug_log(f"[MAIN] Extraction timed out after {extract_timeout}s")
+        await safe_edit(main_msg, f"❌ Extraction timed out ({extract_timeout // 60} min). File too large or server too slow – try a smaller archive.")
     except Exception as e:
         debug_log(f"[MAIN] Extraction failed: {e}")
         await safe_edit(main_msg, f"❌ Extraction failed: {str(e)}")
