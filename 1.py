@@ -101,84 +101,78 @@ def debug_log(msg: str) -> None:
 
 
 def find_extraction_tool() -> str | None:
-    """Find and return path to 7z, UnRAR, or WinRAR on PATH (Linux + Windows) or common Windows locations."""
-    # Check PATH first (Linux: 7z, 7za, unrar; Windows: .exe variants)
-    for tool in ("7z", "7za", "unrar", "7z.exe", "7za.exe", "unrar.exe", "WinRAR.exe", "Rar.exe"):
-        path = shutil.which(tool)
-        if path:
-            return path
+    """Find and return path to first available 7z, UnRAR, or WinRAR."""
+    tools = _get_all_extraction_tools()
+    return tools[0] if tools else None
 
-    # Common Windows install locations (skip on Linux)
-    candidates = []
+
+def _get_all_extraction_tools() -> list[str]:
+    """Return list of extraction tool paths (unrar first for RAR, then 7z, etc.)."""
+    found: list[str] = []
+    seen_paths: set[str] = set()
+    # Prefer unrar for RAR; then 7z/7za (order: unrar, 7z, 7za, WinRAR)
+    for tool in ("unrar", "7z", "7za", "unrar.exe", "7z.exe", "7za.exe", "WinRAR.exe", "Rar.exe"):
+        path = shutil.which(tool)
+        if path and path not in seen_paths:
+            seen_paths.add(path)
+            found.append(path)
+    # Common Windows install locations
     pf = os.environ.get("ProgramFiles", "C:\\Program Files")
     pf86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
-    
     for base_dir in [pf, pf86, "C:\\Program Files", "C:\\Program Files (x86)"]:
-        candidates.extend([
-            os.path.join(base_dir, "7-Zip", "7z.exe"),
-            os.path.join(base_dir, "WinRAR", "WinRAR.exe"),
-            os.path.join(base_dir, "WinRAR", "Rar.exe"),
-            os.path.join(base_dir, "UnRAR", "unrar.exe"),
-        ])
-    
-    for c in candidates:
-        try:
-            if c and os.path.isfile(c):
-                debug_log(f"[TOOLS] Found extraction tool: {c}")
-                return c
-        except Exception:
-            pass
-    
-    return None
+        for rel in ["UnRAR/unrar.exe", "7-Zip/7z.exe", "WinRAR/WinRAR.exe", "WinRAR/Rar.exe"]:
+            c = os.path.join(base_dir, rel)
+            try:
+                if c and os.path.isfile(c) and c not in seen_paths:
+                    seen_paths.add(c)
+                    found.append(c)
+            except Exception:
+                pass
+    return found
+
+
+def _run_extraction_tool(tool: str, archive_path: str, extract_to_dir: str, password: str | None) -> bool:
+    """Run one extraction tool. Returns True on success."""
+    tool_lower = tool.lower()
+    if "7z" in tool_lower:
+        cmd = [tool, "x", "-y", f"-o{extract_to_dir}", archive_path]
+        if password:
+            cmd.insert(2, f"-p{password}")
+    elif "unrar" in tool_lower:
+        cmd = [tool, "x", "-y", "-o+", archive_path, extract_to_dir + os.sep]
+        if password:
+            cmd.insert(-2, f"-p{password}")
+    elif "winrar" in tool_lower or "rar.exe" in tool_lower:
+        cmd = [tool, "x", "-y", "-o+", archive_path, extract_to_dir + os.sep]
+        if password:
+            cmd.insert(-2, f"-p{password}")
+    else:
+        return False
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode == 0:
+        return True
+    if result.stderr:
+        debug_log(f"[TOOLS] {os.path.basename(tool)} stderr: {result.stderr.strip()[:500]}")
+    if result.stdout:
+        debug_log(f"[TOOLS] {os.path.basename(tool)} stdout: {result.stdout.strip()[:500]}")
+    return False
 
 
 def extract_with_available_tool(archive_path: str, extract_to_dir: str, password: str | None) -> bool:
-    """Try to extract RAR with any available tool (7z, UnRAR, WinRAR). Returns True on success."""
-    tool = find_extraction_tool()
-    if not tool:
+    """Try to extract RAR with any available tool (unrar, 7z, WinRAR). Tries each until one succeeds."""
+    tools = _get_all_extraction_tools()
+    if not tools:
         debug_log(f"[TOOLS] No extraction tool found")
         return False
-    
-    debug_log(f"[TOOLS] Using extraction tool: {tool}")
-    
-    try:
-        # Build command based on tool
-        if "7z" in tool.lower():
-            cmd = [tool, "x", "-y", f"-o{extract_to_dir}", archive_path]
-            if password:
-                cmd.insert(2, f"-p{password}")
-        elif "unrar" in tool.lower():
-            cmd = [tool, "x", "-y", "-o+"]  # -o+ means overwrite without prompt
-            if password:
-                cmd.append(f"-p{password}")
-            cmd.extend([archive_path, extract_to_dir + os.sep])
-        elif "winrar" in tool.lower() or "rar.exe" in tool.lower():
-            cmd = [tool, "x", "-y", "-o+"]
-            if password:
-                cmd.append(f"-p{password}")
-            cmd.extend([archive_path, extract_to_dir + os.sep])
-        else:
-            debug_log(f"[TOOLS] Unknown tool: {tool}")
-            return False
-        
-        debug_log(f"[TOOLS] Running command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode == 0:
-            debug_log(f"[TOOLS] Extraction succeeded with {os.path.basename(tool)}")
-            return True
-        else:
-            stderr = result.stderr.strip() if result.stderr else ""
-            stdout = result.stdout.strip() if result.stdout else ""
-            debug_log(f"[TOOLS] Extraction failed. Return code: {result.returncode}")
-            if stderr:
-                debug_log(f"[TOOLS] stderr: {stderr}")
-            if stdout:
-                debug_log(f"[TOOLS] stdout: {stdout}")
-            return False
-    except Exception as e:
-        debug_log(f"[TOOLS] Extraction exception: {e}")
-        return False
+    for tool in tools:
+        debug_log(f"[TOOLS] Trying: {tool}")
+        try:
+            if _run_extraction_tool(tool, archive_path, extract_to_dir, password):
+                debug_log(f"[TOOLS] Extraction succeeded with {os.path.basename(tool)}")
+                return True
+        except Exception as e:
+            debug_log(f"[TOOLS] Exception with {tool}: {e}")
+    return False
 
 
 def extract_archive_once(archive_path: str, extract_to_dir: str, password: str | None) -> bool:

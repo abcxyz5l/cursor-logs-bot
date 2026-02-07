@@ -3,10 +3,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install unzip + 7z (Linux): 7z handles zip/7z/rar; unzip for fallback
+# Enable non-free for unrar (needed for RAR extraction)
+RUN echo "deb http://deb.debian.org/debian bookworm non-free non-free-firmware" >> /etc/apt/sources.list.d/non-free.list
+# Install unzip + 7z + unrar so RAR always works (7z alone often fails on RAR)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     p7zip-full \
+    unrar \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
